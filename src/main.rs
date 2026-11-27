@@ -25,13 +25,16 @@ const EXIT_UNDER_REVIEW: u8 = 3;
 const EXIT_REJECTED: u8 = 4;
 const EXIT_STILL_PROCESSING: u8 = 5;
 const USAGE: &str = "usage: ceagle validate [--version VERSION] [--notes FILE] [--api URL]
-       ceagle publish --version VERSION [--notes FILE] [--api URL]
+       ceagle publish --version VERSION [--notes FILE] [--attestation FILE] [--api URL]
+       ceagle checksums
        ceagle login
        ceagle logout
        ceagle --version
 
 ceagle reads ceagle.toml in the current folder. Tokens come from CEAGLE_TOKEN, the token saved
 by ceagle login, or GitHub Actions trusted publishing. --api or CEAGLE_API picks another server.
+ceagle checksums prints the sha256 and name of every release file, for a build attestation that
+publish --attestation sends with the release.
 
 exit codes: 0 done, 1 error, 2 problems to fix, 3 under review, 4 rejected, 5 still processing";
 
@@ -41,6 +44,7 @@ enum Command {
     Version,
     Validate(Options),
     Publish(Options),
+    Checksums,
     Login,
     Logout,
 }
@@ -50,6 +54,7 @@ fn parse_options(arguments: &[String], default_api: String) -> Result<Options, S
         api: default_api,
         version: None,
         notes: None,
+        attestation: None,
     };
     let mut rest = arguments.iter();
     while let Some(argument) = rest.next() {
@@ -57,7 +62,7 @@ fn parse_options(arguments: &[String], default_api: String) -> Result<Options, S
             Some((flag, value)) => (flag, Some(value.to_string())),
             None => (argument.as_str(), None),
         };
-        if !matches!(flag, "--version" | "--notes" | "--api") {
+        if !matches!(flag, "--version" | "--notes" | "--attestation" | "--api") {
             return Err(format!("unknown option {argument}"));
         }
         let value = match inline.or_else(|| rest.next().cloned()) {
@@ -67,6 +72,7 @@ fn parse_options(arguments: &[String], default_api: String) -> Result<Options, S
         match flag {
             "--version" => options.version = Some(value),
             "--notes" => options.notes = Some(value),
+            "--attestation" => options.attestation = Some(value),
             _ => options.api = value,
         }
     }
@@ -84,7 +90,13 @@ fn parse_command(arguments: &[String], default_api: String) -> Result<Command, S
     match first.as_str() {
         "help" | "--help" | "-h" => bare(Command::Help),
         "--version" | "-V" => bare(Command::Version),
-        "validate" => parse_options(rest, default_api).map(Command::Validate),
+        "validate" => {
+            let options = parse_options(rest, default_api)?;
+            if options.attestation.is_some() {
+                return Err("--attestation only works with publish".into());
+            }
+            Ok(Command::Validate(options))
+        }
         "publish" => {
             let options = parse_options(rest, default_api)?;
             if options.version.is_none() {
@@ -92,6 +104,7 @@ fn parse_command(arguments: &[String], default_api: String) -> Result<Command, S
             }
             Ok(Command::Publish(options))
         }
+        "checksums" => bare(Command::Checksums),
         "login" => bare(Command::Login),
         "logout" => bare(Command::Logout),
         other => Err(format!("unknown command {other}")),
@@ -127,6 +140,7 @@ fn main() -> ExitCode {
         }
         Command::Validate(options) => commands::validate(folder, &options, &lookup),
         Command::Publish(options) => commands::publish(folder, &options, &lookup, &waiting),
+        Command::Checksums => commands::checksums(folder).map(|lines| print!("{lines}")),
         Command::Login => auth::login(&lookup).map_err(Failure::Error),
         Command::Logout => auth::logout(&lookup).map_err(Failure::Error),
     };
@@ -155,13 +169,17 @@ mod tests {
     #[test]
     fn parses_commands_and_options() {
         assert_eq!(
-            parse("publish --version 1.2.0 --notes=NOTES.md --api http://127.0.0.1:8090"),
+            parse(
+                "publish --version 1.2.0 --notes=NOTES.md --attestation bundle.json --api http://127.0.0.1:8090"
+            ),
             Ok(Command::Publish(Options {
                 api: "http://127.0.0.1:8090".into(),
                 version: Some("1.2.0".into()),
                 notes: Some("NOTES.md".into()),
+                attestation: Some("bundle.json".into()),
             }))
         );
+        assert_eq!(parse("checksums"), Ok(Command::Checksums));
         assert_eq!(parse(""), Ok(Command::Help));
         assert_eq!(parse("--version"), Ok(Command::Version));
         assert!(
@@ -188,5 +206,10 @@ mod tests {
                 .contains("unexpected argument")
         );
         assert!(parse("deploy").unwrap_err().contains("unknown command"));
+        assert!(
+            parse("validate --attestation bundle.json")
+                .unwrap_err()
+                .contains("only works with publish")
+        );
     }
 }

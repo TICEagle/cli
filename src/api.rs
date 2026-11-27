@@ -111,6 +111,7 @@ pub struct Upload<'a> {
     pub notes: &'a str,
     pub files: &'a [LocalFile],
     pub dependencies: &'a BTreeMap<String, String>,
+    pub attestation: Option<&'a [u8]>,
 }
 
 pub struct Client {
@@ -118,7 +119,11 @@ pub struct Client {
     agent: Agent,
 }
 
-fn multipart(manifest: &[u8], files: &[LocalFile]) -> (String, Vec<u8>) {
+fn multipart(
+    manifest: &[u8],
+    files: &[LocalFile],
+    attestation: Option<&[u8]>,
+) -> (String, Vec<u8>) {
     let seed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos());
@@ -130,7 +135,10 @@ fn multipart(manifest: &[u8], files: &[LocalFile]) -> (String, Vec<u8>) {
                 .windows(candidate.len())
                 .any(|window| window == candidate.as_bytes())
         };
-        if !used(manifest) && !files.iter().any(|file| used(&file.content)) {
+        if !used(manifest)
+            && !files.iter().any(|file| used(&file.content))
+            && !attestation.is_some_and(used)
+        {
             break candidate;
         }
         attempt += 1;
@@ -141,6 +149,10 @@ fn multipart(manifest: &[u8], files: &[LocalFile]) -> (String, Vec<u8>) {
     for file in files {
         body.extend_from_slice(format!("\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{}\"\r\nContent-Type: application/octet-stream\r\n\r\n", file.filename).as_bytes());
         body.extend_from_slice(&file.content);
+    }
+    if let Some(attestation) = attestation {
+        body.extend_from_slice(format!("\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"attestation\"; filename=\"attestation.sigstore.json\"\r\nContent-Type: application/json\r\n\r\n").as_bytes());
+        body.extend_from_slice(attestation);
     }
     body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
     (boundary, body)
@@ -226,7 +238,7 @@ impl Client {
         };
         let manifest =
             serde_json::to_vec(&manifest).map_err(|error| ApiError::Invalid(error.to_string()))?;
-        let (boundary, body) = multipart(&manifest, upload.files);
+        let (boundary, body) = multipart(&manifest, upload.files, upload.attestation);
         let result = self
             .agent
             .post(format!(
@@ -449,6 +461,7 @@ mod tests {
             notes: "",
             files: &[],
             dependencies: &BTreeMap::new(),
+            attestation: None,
         };
         assert!(
             matches!(client.publish("gdash", "t", &upload), Err(ApiError::Problems(problems)) if problems.len() == 2)

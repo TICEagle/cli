@@ -1,10 +1,14 @@
 use std::{
     collections::HashMap,
-    fs,
+    fmt::Write,
+    fs::{self, File},
+    io::Read,
     path::Path,
     thread,
     time::{Duration, Instant},
 };
+
+use ring::digest::{SHA256, digest};
 
 use crate::{
     api::{ApiError, Client, ReleaseResponse, Upload},
@@ -17,6 +21,7 @@ use crate::{
 
 const MISSING_VERSION: &str = "the version is missing";
 const MAX_NOTES_BYTES: usize = 32 << 10;
+const MAX_ATTESTATION_BYTES: u64 = 128 << 10;
 const PROCESSING: &str = "processing";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -33,6 +38,7 @@ pub struct Options {
     pub api: String,
     pub version: Option<String>,
     pub notes: Option<String>,
+    pub attestation: Option<String>,
 }
 
 pub struct Waiting {
@@ -67,7 +73,25 @@ fn read_notes(path: &str) -> Result<String, Failure> {
     Ok(notes)
 }
 
-fn prepare(folder: &Path) -> Result<(Config, Release), Failure> {
+fn read_attestation(path: &str) -> Result<Vec<u8>, Failure> {
+    let mut content = Vec::new();
+    File::open(path)
+        .and_then(|file| {
+            file.take(MAX_ATTESTATION_BYTES + 1)
+                .read_to_end(&mut content)
+        })
+        .map_err(|error| {
+            Failure::Error(format!("failed to read the attestation {path}: {error}"))
+        })?;
+    if content.len() as u64 > MAX_ATTESTATION_BYTES {
+        return Err(fail(&[format!(
+            "the attestation in {path} is larger than 128 KiB"
+        )]));
+    }
+    Ok(content)
+}
+
+fn load(folder: &Path) -> Result<(Config, Release), Failure> {
     let config = Config::load(folder).map_err(|error| match error {
         ConfigError::Read(_) => Failure::Error(error.to_string()),
         _ => {
@@ -76,6 +100,23 @@ fn prepare(folder: &Path) -> Result<(Config, Release), Failure> {
         }
     })?;
     let release = release::load(folder, &config).map_err(|problem| fail(&[problem]))?;
+    Ok((config, release))
+}
+
+pub fn checksums(folder: &Path) -> Result<String, Failure> {
+    let (_, release) = load(folder)?;
+    let mut lines = String::new();
+    for file in &release.files {
+        for byte in digest(&SHA256, &file.content).as_ref() {
+            let _ = write!(lines, "{byte:02x}");
+        }
+        let _ = writeln!(lines, "  {}", file.filename);
+    }
+    Ok(lines)
+}
+
+fn prepare(folder: &Path) -> Result<(Config, Release), Failure> {
+    let (config, release) = load(folder)?;
     let noun = if release.files.len() == 1 {
         "file"
     } else {
@@ -125,6 +166,7 @@ pub fn validate(folder: &Path, options: &Options, lookup: Lookup) -> Result<(), 
         notes: &notes,
         files: &release.files,
         dependencies: &config.dependencies,
+        attestation: None,
     };
     let answer = client
         .dry_run(&config.project, &token.value, &upload)
@@ -189,6 +231,11 @@ pub fn publish(
         .map(read_notes)
         .transpose()?
         .unwrap_or_default();
+    let attestation = options
+        .attestation
+        .as_deref()
+        .map(read_attestation)
+        .transpose()?;
     if !problems.is_empty() {
         return Err(fail(&problems));
     }
@@ -198,8 +245,13 @@ pub fn publish(
             "publishing needs a token: run ceagle login, set {TOKEN_VARIABLE}, or run in GitHub Actions with permissions: id-token: write"
         ))
     })?;
+    let attested = if attestation.is_some() {
+        " and its attestation"
+    } else {
+        ""
+    };
     println!(
-        "\nUploading {} {version} with {}.",
+        "\nUploading {} {version}{attested} with {}.",
         config.project, token.via
     );
     let upload = Upload {
@@ -207,6 +259,7 @@ pub fn publish(
         notes: &notes,
         files: &release.files,
         dependencies: &config.dependencies,
+        attestation: attestation.as_deref(),
     };
     let accepted = client
         .publish(&config.project, &token.value, &upload)
@@ -322,6 +375,7 @@ mod tests {
             api: base.into(),
             version: version.map(String::from),
             notes: None,
+            attestation: None,
         }
     }
 
@@ -388,6 +442,64 @@ mod tests {
             matches!(publish(&root, &options, &with_token, &QUICK), Err(Failure::Error(error)) if error.contains("revoked"))
         );
         server.join().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn publish_sends_the_attestation() {
+        let root = project("attested");
+        let bundle = root.join("bundle.json");
+        fs::write(&bundle, r#"{"mediaType":"sigstore"}"#).unwrap();
+        let (base, server) = serve(vec![(
+            202,
+            r#"{"version":"1.2.0","status":"published","capabilities":[]}"#.into(),
+        )]);
+        let options = Options {
+            attestation: Some(bundle.display().to_string()),
+            ..options(&base, Some("1.2.0"))
+        };
+        assert_eq!(publish(&root, &options, &with_token, &QUICK), Ok(()));
+        let body = String::from_utf8_lossy(&server.join().unwrap()[0].body).into_owned();
+        assert!(body.contains("name=\"attestation\"; filename=\"attestation.sigstore.json\"\r\nContent-Type: application/json\r\n\r\n{\"mediaType\":\"sigstore\"}\r\n--"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn refuses_a_missing_or_oversized_attestation_before_uploading() {
+        let root = project("oversized");
+        let bundle = root.join("bundle.json");
+        fs::write(&bundle, vec![b' '; MAX_ATTESTATION_BYTES as usize + 1]).unwrap();
+        let attested = |path: &Path| Options {
+            attestation: Some(path.display().to_string()),
+            ..options("http://127.0.0.1:9", Some("1.2.0"))
+        };
+        assert_eq!(
+            publish(&root, &attested(&bundle), &with_token, &QUICK),
+            Err(Failure::Problems)
+        );
+        assert!(matches!(
+            publish(&root, &attested(&root.join("missing.json")), &with_token, &QUICK),
+            Err(Failure::Error(error)) if error.contains("failed to read the attestation")
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn checksums_lists_every_release_file() {
+        let root = project("checksums");
+        fs::write(root.join("NOTES.md"), "abc").unwrap();
+        fs::write(
+            root.join("ceagle.toml"),
+            "project = \"gdash\"\nfiles = [\"NOTES.md\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            checksums(&root),
+            Ok(
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  NOTES.md\n"
+                    .into()
+            )
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

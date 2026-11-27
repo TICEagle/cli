@@ -57,5 +57,19 @@ Add your repository and workflow as a trusted publisher on your project's Publis
 
 Without the action, run `ceagle publish --version "$GITHUB_REF_NAME"` in a job with `id-token: write`.
 
+### Build provenance
+In a public repository the action also attests the release files with Sigstore and sends the attestation with the release. CEagle checks it against your files, repository, workflow, commit and run before it publishes, and the release page shows it as verified. To do the same by hand, attest the files `ceagle checksums` lists, then pass the bundle to `ceagle publish`:
+```yaml
+      - run: ceagle checksums > "$RUNNER_TEMP/checksums"
+      - id: attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
+        with:
+          subject-checksums: ${{ runner.temp }}/checksums
+      - run: ceagle publish --version "$GITHUB_REF_NAME" --attestation "$BUNDLE"
+        env:
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+```
+The job needs `id-token: write` and `attestations: write`. CEagle only takes an attestation with trusted publishing. Anyone can check a downloaded file with `gh attestation verify FILE --repo owner/repo`.
+
 ## License
 `ceagle` is free software under the GNU General Public License, version 3. See `LICENSE`.
