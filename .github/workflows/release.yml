@@ -1,0 +1,69 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - run: grep -qx "version = \"${GITHUB_REF_NAME#v}\"" Cargo.toml
+
+  test:
+    uses: ./.github/workflows/test.yml
+
+  build:
+    needs: [version, test]
+    strategy:
+      matrix:
+        include:
+          - { runner: ubuntu-latest, target: x86_64-unknown-linux-musl, name: ceagle-linux-x86_64 }
+          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, name: ceagle-linux-aarch64 }
+          - { runner: macos-latest, target: x86_64-apple-darwin, name: ceagle-macos-x86_64 }
+          - { runner: macos-latest, target: aarch64-apple-darwin, name: ceagle-macos-aarch64 }
+          - { runner: windows-latest, target: x86_64-pc-windows-msvc, name: ceagle-windows-x86_64, extension: .exe, rustflags: -C target-feature=+crt-static }
+    runs-on: ${{ matrix.runner }}
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          echo TARGET_CC=musl-gcc >> "$GITHUB_ENV"
+      - run: rustup update --no-self-update stable && rustup target add ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - shell: bash
+        run: mv "target/${{ matrix.target }}/release/ceagle${{ matrix.extension }}" "${{ matrix.name }}${{ matrix.extension }}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.name }}${{ matrix.extension }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          path: dist
+          merge-multiple: true
+      - working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha256sum ceagle-* > SHA256SUMS
+          cat SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "ceagle ${GITHUB_REF_NAME#v}" --generate-notes ceagle-* SHA256SUMS
